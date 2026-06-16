@@ -9,6 +9,7 @@ import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
 from datetime import datetime
+from scipy.ndimage import gaussian_filter
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURACIÓN
@@ -21,31 +22,6 @@ PATCH_SIZE = 14
 
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ─── Preprocesamiento para ViT ───────────────────────────────────────────────
-def resize_for_dinov2(image, max_size=MAX_RESOLUTION, patch_size=PATCH_SIZE):
-    """
-    Escala la imagen manteniendo el aspect ratio, limitando el lado más largo a max_size.
-    Crucial: Recorta ligeramente para asegurar que las dimensiones sean múltiplos perfectos de 14.
-    """
-    w, h = image.size
-    if max(w, h) > max_size:
-        scale = max_size / max(w, h)
-        new_w, new_h = int(w * scale), int(h * scale)
-        image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    
-    w, h = image.size
-    # Ajustar al múltiplo de patch_size (14) más cercano hacia abajo
-    new_w = (w // patch_size) * patch_size
-    new_h = (h // patch_size) * patch_size
-    
-    # Recorte central
-    left = (w - new_w) / 2
-    top = (h - new_h) / 2
-    right = (w + new_w) / 2
-    bottom = (h + new_h) / 2
-    
-    return image.crop((left, top, right, bottom))
-
 preprocess_tensors = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -55,53 +31,51 @@ preprocess_tensors = transforms.Compose([
 # ─── Extractor de Atención DINOv2 (VERSIÓN QKV) ──────────────────────────────
 class DINOv2AttentionExtractor:
     def __init__(self, model):
-        self.model = model
-        self.hook_handle = None
-        self.attention_weights = None
-        
-        # Interceptamos la proyección QKV del último bloque en lugar de attn_drop
-        self.hook_handle = self.model.blocks[-1].attn.qkv.register_forward_hook(
-            self._qkv_hook
-        )
+        self.model = model          # ← PRIMERO, antes de usar self.model
+        self.attention_list = []
+        self.hook_handles   = []
+
+        for block in self.model.blocks[-4:]:
+            h = block.attn.qkv.register_forward_hook(self._qkv_hook)
+            self.hook_handles.append(h)
 
     def _qkv_hook(self, module, input, output):
-        # El output de qkv tiene forma [Batch, N_tokens, 3 * embed_dim]
         B, N, C_times_3 = output.shape
-        
-        # Obtenemos la configuración de las cabezas (heads) desde el modelo
         num_heads = self.model.blocks[-1].attn.num_heads
-        head_dim = (C_times_3 // 3) // num_heads
-        
-        # Desempaquetamos Q, K y V
-        # Hacemos reshape a: [3, Batch, num_heads, N_tokens, head_dim]
-        qkv = output.reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
-        q, k = qkv[0], qkv[1]  # V (qkv[2]) no lo necesitamos para calcular la atención
-        
-        # Factor de escala estándar en Transformers
-        scale = head_dim ** -0.5
-        q = q * scale
-        
-        # Multiplicamos Q * K transpuesta para obtener los puntajes crudos
-        attn = q @ k.transpose(-2, -1)  # [Batch, num_heads, N_tokens, N_tokens]
-        
-        # Aplicamos Softmax para obtener la distribución final de los mapas de atención
+        head_dim  = (C_times_3 // 3) // num_heads
+
+        qkv  = output.reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
+        q, k = qkv[0], qkv[1]
+
+        attn = (q * (head_dim ** -0.5)) @ k.transpose(-2, -1)
         attn = attn.softmax(dim=-1)
-        
-        self.attention_weights = attn.detach()
+
+        self.attention_list.append(attn.detach())
 
     def generate(self, x):
+        self.attention_list = []    # limpia antes de cada imagen
+
         with torch.no_grad():
             self.model(x)
-            
-        attn = self.attention_weights[0]  # [num_heads, N, N]
-        cls_attn = attn[:, 0, 1:]  # [num_heads, num_patches]
-        mean_attn = cls_attn.mean(dim=0)  # [num_patches]
+
+        if len(self.attention_list) == 0:
+            raise RuntimeError("Ningún hook capturó datos.")
+
+        # Stack: [num_blocks, num_heads, N, N]
+        all_attns = torch.stack(self.attention_list)
+
+        # Con dinov2_vitb14_reg (4 register tokens después del CLS):
+        NUM_REGISTERS = 4
+        cls_attn = all_attns[:, 0, :, 0, 1 + NUM_REGISTERS:]
+
+        # max sobre cabezas por bloque → mean sobre bloques
+        mean_attn = cls_attn.max(dim=1).values.mean(dim=0)
+
         return mean_attn
 
     def close(self):
-        if self.hook_handle:
-            self.hook_handle.remove()
-
+        for h in self.hook_handles:
+            h.remove()
 # ─── Utilidades Visuales ──────────────────────────────────────────────────────
 def overlay_heatmap(image_pil, cam, alpha=ALPHA_OVERLAY):
     img = np.array(image_pil).astype(np.uint8)
@@ -110,16 +84,29 @@ def overlay_heatmap(image_pil, cam, alpha=ALPHA_OVERLAY):
     overlay = (alpha * heatmap + (1 - alpha) * img).astype(np.uint8)
     return overlay
 
-def resize_for_dinov2(image, patch_size=PATCH_SIZE):
-    """Ajusta la imagen usando Padding para que sea múltiplo de 14."""
+# ─── Preprocesamiento para ViT ────────────────────────────────────────────────
+def resize_for_dinov2(image, max_size=MAX_RESOLUTION, patch_size=PATCH_SIZE):
+    """
+    Escala la imagen manteniendo aspect ratio, limitando el lado mayor a max_size.
+    Luego hace center crop para que ambas dimensiones sean múltiplos de patch_size.
+    """
     w, h = image.size
-    pad_w = (patch_size - w % patch_size) % patch_size
-    pad_h = (patch_size - h % patch_size) % patch_size
-    
-    # Añadimos un borde negro (0,0,0) para completar el múltiplo
-    new_image = Image.new("RGB", (w + pad_w, h + pad_h), (0, 0, 0))
-    new_image.paste(image, (0, 0))
-    return new_image
+    if max(w, h) > max_size:
+        scale = max_size / max(w, h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    w, h = image.size
+    new_w = (w // patch_size) * patch_size
+    new_h = (h // patch_size) * patch_size
+
+    # Recorte central — coordenadas ENTERAS (bug corregido)
+    left   = (w - new_w) // 2
+    top    = (h - new_h) // 2
+    right  = left + new_w
+    bottom = top  + new_h
+
+    return image.crop((left, top, right, bottom))
 
 def process_image(image_path, model, extractor, output_dir, device):
     print(f"  → Analizando: {Path(image_path).name}")
@@ -137,10 +124,19 @@ def process_image(image_path, model, extractor, output_dir, device):
         # El mapa de atención es (h/14) * (w/14)
         h_patches, w_patches = h // PATCH_SIZE, w // PATCH_SIZE
         attn_map = raw_attn.reshape(h_patches, w_patches).cpu().numpy()
+        attn_map = gaussian_filter(attn_map, sigma=1.0)
         
-        # 1. Normalización local: evitaremos que valores extremos sesguen todo
+        # 1.
+        # FIX: normalización robusta por percentil (evita que un outlier colapse todo)
+        p_low  = np.percentile(attn_map, 2)
+        p_high = np.percentile(attn_map, 98)
+        attn_map = np.clip(attn_map, p_low, p_high)
         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
         
+        # Después de normalizar, antes del upsample
+        threshold = attn_map.mean() + 0.5 * attn_map.std()
+        attn_map = np.where(attn_map >= threshold, attn_map, attn_map * 0.1)
+
         # 2. Upsampling a la resolución original (sin el padding)
         attn_map_resized = cv2.resize(attn_map, (image_original.size[0], image_original.size[1]), 
                                       interpolation=cv2.INTER_CUBIC)
@@ -185,39 +181,63 @@ def process_image(image_path, model, extractor, output_dir, device):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     print("=" * 60)
-    print("  Atención Semántica · Meta DINOv2 (ViT-Base)")
+    print("  Atención Semántica · Meta DINOv2 (ViT-Base/reg)")
     print("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n[Hardware] Usando: {device.type.upper()}")
 
+    # ── Selección de directorio ──────────────────────────────────
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    image_paths = filedialog.askopenfilenames(title="Selecciona imágenes")
+    input_dir = filedialog.askdirectory(title="Selecciona el directorio del dataset")
     root.destroy()
 
-    if not image_paths:
+    if not input_dir:
         print("  ✗ Cancelado.")
         return
 
-    print("\n[Cargando Modelo] Descargando/Cargando DINOv2 desde PyTorch Hub...")
-    # dinov2_vitb14 es el balance perfecto entre precisión y velocidad
-    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14').to(device)
+    input_dir  = Path(input_dir)
+    output_dir = ('output_' + input_dir.name)
+
+    # ── Escanear imágenes ────────────────────────────────────────
+    SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
+    image_paths = sorted([
+        p for p in input_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+    ])
+
+    if not image_paths:
+        print(f"  ✗ No se encontraron imágenes en: {input_dir}")
+        return
+
+    print(f"\n[Dataset] {input_dir.name}/ → {len(image_paths)} imágenes encontradas")
+
+    # ── Modelo ───────────────────────────────────────────────────
+    print("\n[Cargando Modelo] DINOv2 ViT-Base con registers...")
+    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14_reg').to(device)
     model.eval()
-    
+
     extractor = DINOv2AttentionExtractor(model)
 
+    # ── Procesamiento ────────────────────────────────────────────
     print(f"\n[Procesando] Cola de {len(image_paths)} imágenes...")
+    print(f"[Output]     {output_dir}")
     print("-" * 60)
 
+    ok, fail = 0, 0
     for i, path in enumerate(image_paths, 1):
-        print(f"[{i}/{len(image_paths)}]", end=" ")
-        process_image(path, model, extractor, OUTPUT_DIR, device)
+        print(f"[{i:>4}/{len(image_paths)}]", end=" ")
+        if process_image(path, model, extractor, output_dir, device):
+            ok += 1
+        else:
+            fail += 1
 
     extractor.close()
     print("-" * 60)
-    print(f"  Resultados en: {OUTPUT_DIR}\n")
+    print(f"  ✓ Completadas: {ok}  ✗ Fallidas: {fail}")
+    print(f"  Resultados en: {output_dir}\n")
 
 if __name__ == "__main__":
     main()

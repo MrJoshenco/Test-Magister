@@ -1,6 +1,8 @@
 #carpeta Dataset tesis
 Dataset_tesis/
 
+OLD/
+
 #env
 gradcam/
 .venv/
