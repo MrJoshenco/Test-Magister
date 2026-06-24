@@ -6,3 +6,4 @@ OLD/
 #env
 gradcam/
 .venv/
+.gitignore

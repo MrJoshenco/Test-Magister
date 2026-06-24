@@ -127,7 +127,7 @@ def process_image(image_path, model, extractor, output_dir, device):
         attn_map = gaussian_filter(attn_map, sigma=1.0)
         
         # 1.
-        # FIX: normalización robusta por percentil (evita que un outlier colapse todo)
+        # FIX: normalización robusta por percentil (evita que un outlier colapse todo) #####revisar percentiles 1 a 99 
         p_low  = np.percentile(attn_map, 2)
         p_high = np.percentile(attn_map, 98)
         attn_map = np.clip(attn_map, p_low, p_high)
@@ -202,7 +202,7 @@ def main():
     output_dir = ('output_' + input_dir.name)
 
     # ── Escanear imágenes ────────────────────────────────────────
-    SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
+    SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp",".ARW"}
     image_paths = sorted([
         p for p in input_dir.iterdir()
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
