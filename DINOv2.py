@@ -17,7 +17,7 @@ from scipy.ndimage import gaussian_filter
 
 OUTPUT_DIR = "./dinov2_outputs"
 ALPHA_OVERLAY = 0.6
-MAX_RESOLUTION = 518  # Múltiplo de 14 (tamaño del parche de DINOv2)
+MAX_RESOLUTION = 1036  # Múltiplo de 14 (tamaño del parche de DINOv2) 518 1036 1554
 PATCH_SIZE = 14
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -77,12 +77,83 @@ class DINOv2AttentionExtractor:
         for h in self.hook_handles:
             h.remove()
 # ─── Utilidades Visuales ──────────────────────────────────────────────────────
+def make_heatmap_bgr(cam):
+    """cam: float [0,1] → heatmap color BGR (uint8), listo para cv2.imwrite."""
+    return cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+
 def overlay_heatmap(image_pil, cam, alpha=ALPHA_OVERLAY):
     img = np.array(image_pil).astype(np.uint8)
     heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     overlay = (alpha * heatmap + (1 - alpha) * img).astype(np.uint8)
     return overlay
+
+def guided_filter(guide_gray, src, radius=20, eps=1e-3):
+    """
+    Guided filter (He et al.) con guía en escala de grises, implementado con
+    box filters puros (no requiere opencv-contrib).
+
+    guide_gray : float32 [0,1], imagen original en escala de grises, tamaño full-res
+    src        : float32 [0,1], mapa a refinar, YA escalado al mismo tamaño que guide_gray
+    radius     : tamaño de ventana del box filter → controla cuánto "mira" alrededor
+    eps        : regularización → más alto = más suave / menos detalle de textura
+
+    Devuelve el mapa refinado, alineado a los bordes reales de la imagen.
+    """
+    I = guide_gray.astype(np.float32)
+    p = src.astype(np.float32)
+    ksize = (radius, radius)
+
+    mean_I  = cv2.boxFilter(I, cv2.CV_32F, ksize)
+    mean_p  = cv2.boxFilter(p, cv2.CV_32F, ksize)
+    mean_Ip = cv2.boxFilter(I * p, cv2.CV_32F, ksize)
+    cov_Ip  = mean_Ip - mean_I * mean_p
+
+    mean_II = cv2.boxFilter(I * I, cv2.CV_32F, ksize)
+    var_I   = mean_II - mean_I * mean_I
+
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, ksize)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, ksize)
+
+    q = mean_a * I + mean_b
+    return np.clip(q, 0.0, 1.0)
+
+def make_binary_mask(cam_guided_full_res, blur_ksize=0, method="relative", 
+                      k_std=0.5, fixed_frac=0.35):
+    """
+    method:
+      - "otsu"     : comportamiento original
+      - "relative" : umbral = mean + k_std * std  (recomendado con temperature scaling)
+      - "fixed"    : umbral = fixed_frac * max(mapa)
+    """
+    cam = cam_guided_full_res.astype(np.float32)
+    if blur_ksize and blur_ksize > 1:
+        cam = cv2.GaussianBlur(cam, (blur_ksize, blur_ksize), 0)
+
+    if method == "otsu":
+        cam_u8 = np.uint8(255 * cam)
+        _, mask_full = cv2.threshold(cam_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    elif method == "relative":
+        thresh_val = cam.mean() + k_std * cam.std()
+        mask_full = np.where(cam > thresh_val, 255, 0).astype(np.uint8)
+
+    elif method == "fixed":
+        thresh_val = fixed_frac * cam.max()
+        mask_full = np.where(cam > thresh_val, 255, 0).astype(np.uint8)
+
+    else:
+        raise ValueError(f"Método desconocido: {method}")
+
+    # Limpieza morfológica (igual que antes)
+    kernel = np.ones((3, 3), np.uint8)
+    mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_CLOSE, kernel)
+    mask_full = cv2.morphologyEx(mask_full, cv2.MORPH_OPEN, kernel)
+
+    return mask_full
 
 # ─── Preprocesamiento para ViT ────────────────────────────────────────────────
 def resize_for_dinov2(image, max_size=MAX_RESOLUTION, patch_size=PATCH_SIZE):
@@ -134,44 +205,47 @@ def process_image(image_path, model, extractor, output_dir, device):
         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
         
         # Después de normalizar, antes del upsample
-        threshold = attn_map.mean() + 0.5 * attn_map.std()
-        attn_map = np.where(attn_map >= threshold, attn_map, attn_map * 0.1)
+        TEMPERATURE = 0.5  # T < 1 agudiza; experimentar entre 0.3-0.7
+        attn_map = np.power(attn_map, 1.0 / TEMPERATURE)
+        attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
 
         # 2. Upsampling a la resolución original (sin el padding)
-        attn_map_resized = cv2.resize(attn_map, (image_original.size[0], image_original.size[1]), 
-                                      interpolation=cv2.INTER_CUBIC)
-        
+        target_size = (image_original.size[0], image_original.size[1])  # (W, H) para cv2
+        attn_map_cubic = cv2.resize(attn_map, target_size,
+                                     interpolation=cv2.INTER_CUBIC)
+        attn_map_cubic = np.clip(attn_map_cubic, 0.0, 1.0)
+
+        # 2.b Refinado edge-aware con guided filter: usa la imagen original en
+        #     escala de grises como guía para que el mapa se pegue a los bordes
+        #     reales del sujeto, en vez de quedar "borroso" o "en bloques".
+        guide_gray = cv2.cvtColor(np.array(image_original), cv2.COLOR_RGB2GRAY)
+        guide_gray = guide_gray.astype(np.float32) / 255.0
+        attn_map_resized = guided_filter(guide_gray, attn_map_cubic, radius=25, eps=1e-3)
+
         # 3. Aplicar Overlay sobre la imagen original (no la padded)
-        overlay = overlay_heatmap(image_original, attn_map_resized)
+        overlay = overlay_heatmap(image_original, attn_map_resized)  # RGB
 
+        # 4. Mapa de calor puro (color BGR, listo para imwrite)
+        heatmap_bgr = make_heatmap_bgr(attn_map_resized)
 
-        # 4. Guardar Grid
+        # 5. Máscara binaria (fondo vs. detección), umbralizada directamente
+        #    sobre el mapa ya refinado a resolución completa → contornos finos
+        mask_full = make_binary_mask(attn_map_resized, method="relative", k_std=0.5)
+
+        # 6. Guardar los 3 archivos por separado
         out_path = Path(output_dir)
         out_path.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%H%M%S")
-        base_name = f"{Path(image_path).stem}_DINOv2_{timestamp}"
+        base_name = f"{Path(image_path).stem}"
 
-        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-        fig.patch.set_facecolor("#0f0f0f")
-        fig.suptitle(f"DINOv2 Self-Attention Map ({w}x{h})", color="white", fontsize=13, fontweight="bold", y=1.01)
+        overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
 
-        axes[0].imshow(image_resized)
-        axes[0].set_title("Original", color="#aaaaaa", fontsize=10)
-        axes[0].axis("off")
+        cv2.imwrite(str(out_path / f"{base_name}_heatmap.png"), heatmap_bgr)
+        cv2.imwrite(str(out_path / f"{base_name}_overlay.png"), overlay_bgr)
+        cv2.imwrite(str(out_path / f"{base_name}.png"), mask_full)
 
-        axes[1].imshow(attn_map_resized, cmap="jet")
-        axes[1].set_title("Attention (CLS Token)", color="#aaaaaa", fontsize=10)
-        axes[1].axis("off")
-
-        axes[2].imshow(overlay)
-        axes[2].set_title("Segmentación Estructural", color="#aaaaaa", fontsize=10)
-        axes[2].axis("off")
-
-        plt.tight_layout()
-        plt.savefig(out_path / f"{base_name}_grid.png", dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-        plt.close()
-
-        print(f"     ✓ Procesado con {h_patches * w_patches} tokens espaciales → OK")
+        print(f"     ✓ Procesado con {h_patches * w_patches} tokens espaciales → OK "
+              f"(heatmap / overlay / mask)")
         return True
 
     except Exception as e:

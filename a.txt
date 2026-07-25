@@ -1,0 +1,10 @@
+
+
+python eval_saliency.py --gt_dir output_Dataset_tesis_nuemerado/got_masks --pred_dir output_Dataset_tesis_nuemerado/1036Dinov2TempMask/
+
+
+
+/home/joshe/projects/Personal/Test-Magister/.venv/bin/python /home/joshe/projects/Personal/Test-Magister/DINOv2.py
+
+
+rename 's/\b(\d+)\.png$/sprintf("%03d.png", $1)/e' *.png
