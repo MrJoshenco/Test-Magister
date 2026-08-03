@@ -17,8 +17,18 @@ from scipy.ndimage import gaussian_filter
 
 OUTPUT_DIR = "./dinov2_outputs"
 ALPHA_OVERLAY = 0.6
-MAX_RESOLUTION = 1036  # Múltiplo de 14 (tamaño del parche de DINOv2) 518 1036 1554
+MAX_RESOLUTION = 518  # Múltiplo de 14 (tamaño del parche de DINOv2). 518 es seguro para GPUs ~6GB.
 PATCH_SIZE = 14
+
+# ─── Hiperparámetros ajustables del pipeline ─────────────────────────────────
+# Estas constantes pueden ser modificadas por tune_dinov2.py para grid search.
+GAUSSIAN_SIGMA = 1.0          # Suavizado gaussiano del mapa de atención
+PERCENTILE_LOW = 2            # Percentil inferior para normalización robusta
+PERCENTILE_HIGH = 98          # Percentil superior para normalización robusta
+TEMPERATURE = 0.3             # Sharpening del mapa (<1 agudiza, >1 suaviza)
+GUIDED_FILTER_RADIUS = 25     # Radio del guided filter (edge-aware smoothing)
+GUIDED_FILTER_EPS = 1e-3      # Regularización del guided filter
+K_STD = 0.7                   # Factor del umbral relativo: mean + k_std * std
 
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -195,17 +205,17 @@ def process_image(image_path, model, extractor, output_dir, device):
         # El mapa de atención es (h/14) * (w/14)
         h_patches, w_patches = h // PATCH_SIZE, w // PATCH_SIZE
         attn_map = raw_attn.reshape(h_patches, w_patches).cpu().numpy()
-        attn_map = gaussian_filter(attn_map, sigma=1.0)
+        attn_map = gaussian_filter(attn_map, sigma=GAUSSIAN_SIGMA)
         
         # 1.
         # FIX: normalización robusta por percentil (evita que un outlier colapse todo) #####revisar percentiles 1 a 99 
-        p_low  = np.percentile(attn_map, 2)
-        p_high = np.percentile(attn_map, 98)
+        p_low  = np.percentile(attn_map, PERCENTILE_LOW)
+        p_high = np.percentile(attn_map, PERCENTILE_HIGH)
         attn_map = np.clip(attn_map, p_low, p_high)
         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
         
         # Después de normalizar, antes del upsample
-        TEMPERATURE = 0.5  # T < 1 agudiza; experimentar entre 0.3-0.7
+        # TEMPERATURE < 1 agudiza; experimentar entre 0.3-0.7
         attn_map = np.power(attn_map, 1.0 / TEMPERATURE)
         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
 
@@ -220,7 +230,7 @@ def process_image(image_path, model, extractor, output_dir, device):
         #     reales del sujeto, en vez de quedar "borroso" o "en bloques".
         guide_gray = cv2.cvtColor(np.array(image_original), cv2.COLOR_RGB2GRAY)
         guide_gray = guide_gray.astype(np.float32) / 255.0
-        attn_map_resized = guided_filter(guide_gray, attn_map_cubic, radius=25, eps=1e-3)
+        attn_map_resized = guided_filter(guide_gray, attn_map_cubic, radius=GUIDED_FILTER_RADIUS, eps=GUIDED_FILTER_EPS)
 
         # 3. Aplicar Overlay sobre la imagen original (no la padded)
         overlay = overlay_heatmap(image_original, attn_map_resized)  # RGB
@@ -230,7 +240,7 @@ def process_image(image_path, model, extractor, output_dir, device):
 
         # 5. Máscara binaria (fondo vs. detección), umbralizada directamente
         #    sobre el mapa ya refinado a resolución completa → contornos finos
-        mask_full = make_binary_mask(attn_map_resized, method="relative", k_std=0.5)
+        mask_full = make_binary_mask(attn_map_resized, method="relative", k_std=K_STD)
 
         # 6. Guardar los 3 archivos por separado
         out_path = Path(output_dir)
@@ -307,6 +317,10 @@ def main():
             ok += 1
         else:
             fail += 1
+
+        # Liberar memoria de CUDA entre imágenes para evitar fragmentación y OOM
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     extractor.close()
     print("-" * 60)
