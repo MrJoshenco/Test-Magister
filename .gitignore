@@ -1,0 +1,17 @@
+#carpeta Dataset tesis
+
+Dataset_tesis_numerado/
+output_Dataset_tesis_numerado/
+outputs_all_methods/
+TokenCut/
+LOST/
+TokenCut
+tune_dinov2_partial.csv
+
+
+#env
+gradcam/
+__pycache__/
+.venv/
+.gitignore
+
