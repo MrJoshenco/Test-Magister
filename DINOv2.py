@@ -17,7 +17,7 @@ from scipy.ndimage import gaussian_filter
 
 OUTPUT_DIR = "./dinov2_outputs"
 ALPHA_OVERLAY = 0.6
-MAX_RESOLUTION = 518  # Múltiplo de 14 (tamaño del parche de DINOv2). 518 es seguro para GPUs ~6GB.
+MAX_RESOLUTION = 518  # Múltiplo de 14 (tamaño del parche de DINOv2). 
 PATCH_SIZE = 14
 
 # ─── Hiperparámetros ajustables del pipeline ─────────────────────────────────
