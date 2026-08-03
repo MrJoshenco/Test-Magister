@@ -480,6 +480,17 @@ def main():
                         help="Nivel de confianza para intervalos.")
     parser.add_argument("--skip", type=str, default="",
                         help="Métodos a omitir separados por coma (tokencut,lost,dinov2).")
+    parser.add_argument("--exclude_ids", type=str, default="",
+                        help="IDs numéricos de imágenes a excluir separados por coma (p. ej. 1,6,7).")
+
+    # Parámetros de DINOv2 (defaults = configuración ganadora del tuning, rank 1 por mIoU)
+    parser.add_argument("--dinov2_max_resolution", type=int, default=980)
+    parser.add_argument("--dinov2_temperature", type=float, default=0.3)
+    parser.add_argument("--dinov2_guided_filter_radius", type=int, default=15)
+    parser.add_argument("--dinov2_k_std", type=float, default=0.2)
+    parser.add_argument("--dinov2_gaussian_sigma", type=float, default=1.5)
+    parser.add_argument("--dinov2_percentile_low", type=int, default=2)
+    parser.add_argument("--dinov2_percentile_high", type=int, default=98)
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
@@ -488,15 +499,17 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     skip = set(m.strip().lower() for m in args.skip.split(",") if m.strip())
+    exclude_ids = set(int(x.strip()) for x in args.exclude_ids.split(",") if x.strip())
 
-    image_paths = list_images(input_dir)
+    image_paths = [p for p in list_images(input_dir) if int(p.stem) not in exclude_ids]
     if not image_paths:
         print(f"No se encontraron imágenes en {input_dir}")
         return
 
+    excluded_info = f" (excluyendo {len(exclude_ids)} IDs de tuning)" if exclude_ids else ""
     print(f"=" * 80)
     print(" Ejecutando TokenCut + LOST + DINOv2")
-    print(f" Dataset: {input_dir} ({len(image_paths)} imágenes)")
+    print(f" Dataset: {input_dir} ({len(image_paths)} imágenes){excluded_info}")
     print(f" GT:      {gt_dir}")
     print(f" Output:  {output_dir}")
     print(f"=" * 80)
@@ -507,15 +520,15 @@ def main():
     # Parámetros de tunning para DINOv2
     dinov2_params = {
         "ALPHA_OVERLAY": 0.6,
-        "GAUSSIAN_SIGMA": 1.0,
+        "GAUSSIAN_SIGMA": args.dinov2_gaussian_sigma,
         "GUIDED_FILTER_EPS": 0.001,
-        "GUIDED_FILTER_RADIUS": 25,
-        "K_STD": 0.7,
-        "MAX_RESOLUTION": 518,
+        "GUIDED_FILTER_RADIUS": args.dinov2_guided_filter_radius,
+        "K_STD": args.dinov2_k_std,
+        "MAX_RESOLUTION": args.dinov2_max_resolution,
         "PATCH_SIZE": 14,
-        "PERCENTILE_HIGH": 100,
-        "PERCENTILE_LOW": 1,
-        "TEMPERATURE": 0.3,
+        "PERCENTILE_HIGH": args.dinov2_percentile_high,
+        "PERCENTILE_LOW": args.dinov2_percentile_low,
+        "TEMPERATURE": args.dinov2_temperature,
     }
 
     # 1. TokenCut

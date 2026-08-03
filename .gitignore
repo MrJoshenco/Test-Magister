@@ -7,7 +7,11 @@ TokenCut/
 LOST/
 TokenCut
 tune_dinov2_partial.csv
-
+outputs_rank1_holdout
+outputs_rank1_full
+outputs_rank1_full
+outputs_all_methods_holdout
+output_Dataset_tesis_numerado
 
 #env
 gradcam/
