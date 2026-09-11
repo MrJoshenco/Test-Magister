@@ -37,7 +37,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import DINOv2
 import eval_saliency
 
-INPUT_DIR = PROJECT_ROOT / "Dataset_tesis_numerado"
+INPUT_DIR = PROJECT_ROOT / "Dataset_tesis_numerado_ligero"
 GT_DIR = PROJECT_ROOT / "got_masks_v2"
 
 # ─── Configuración del experimento ──────────────────────────────────────────────
