@@ -483,12 +483,14 @@ def main():
     parser.add_argument("--exclude_ids", type=str, default="",
                         help="IDs numéricos de imágenes a excluir separados por coma (p. ej. 1,6,7).")
 
-    # Parámetros de DINOv2 (defaults = configuración ganadora del tuning, rank 1 por mIoU)
-    parser.add_argument("--dinov2_max_resolution", type=int, default=980)
+    # Parámetros de DINOv2 (defaults = config top-1 por mIoU del tuning,
+    # verificada en tune_dinov2_partial.csv: mIoU=0.4085; coincide con la
+    # corrida canónica del paper, commit 1c8a8c4)
+    parser.add_argument("--dinov2_max_resolution", type=int, default=518)
     parser.add_argument("--dinov2_temperature", type=float, default=0.3)
-    parser.add_argument("--dinov2_guided_filter_radius", type=int, default=15)
-    parser.add_argument("--dinov2_k_std", type=float, default=0.2)
-    parser.add_argument("--dinov2_gaussian_sigma", type=float, default=1.5)
+    parser.add_argument("--dinov2_guided_filter_radius", type=int, default=25)
+    parser.add_argument("--dinov2_k_std", type=float, default=0.7)
+    parser.add_argument("--dinov2_gaussian_sigma", type=float, default=1.0)
     # Canonical paper config (matches commit 1c8a8c4 and all reported results)
     parser.add_argument("--dinov2_percentile_low", type=int, default=1)
     # Canonical paper config (matches commit 1c8a8c4 and all reported results)
