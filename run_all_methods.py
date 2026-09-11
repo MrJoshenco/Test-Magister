@@ -489,8 +489,10 @@ def main():
     parser.add_argument("--dinov2_guided_filter_radius", type=int, default=15)
     parser.add_argument("--dinov2_k_std", type=float, default=0.2)
     parser.add_argument("--dinov2_gaussian_sigma", type=float, default=1.5)
-    parser.add_argument("--dinov2_percentile_low", type=int, default=2)
-    parser.add_argument("--dinov2_percentile_high", type=int, default=98)
+    # Canonical paper config (matches commit 1c8a8c4 and all reported results)
+    parser.add_argument("--dinov2_percentile_low", type=int, default=1)
+    # Canonical paper config (matches commit 1c8a8c4 and all reported results)
+    parser.add_argument("--dinov2_percentile_high", type=int, default=100)
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)

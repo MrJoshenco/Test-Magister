@@ -23,8 +23,10 @@ PATCH_SIZE = 14
 # ─── Hiperparámetros ajustables del pipeline ─────────────────────────────────
 # Estas constantes pueden ser modificadas por tune_dinov2.py para grid search.
 GAUSSIAN_SIGMA = 1.0          # Suavizado gaussiano del mapa de atención
-PERCENTILE_LOW = 2            # Percentil inferior para normalización robusta
-PERCENTILE_HIGH = 98          # Percentil superior para normalización robusta
+PERCENTILE_LOW = 1            # Percentil inferior para normalización robusta
+                              # Canonical paper config (matches commit 1c8a8c4 and all reported results)
+PERCENTILE_HIGH = 100         # Percentil superior para normalización robusta
+                              # Canonical paper config (matches commit 1c8a8c4 and all reported results)
 TEMPERATURE = 0.3             # Sharpening del mapa (<1 agudiza, >1 suaviza)
 GUIDED_FILTER_RADIUS = 25     # Radio del guided filter (edge-aware smoothing)
 GUIDED_FILTER_EPS = 1e-3      # Regularización del guided filter
